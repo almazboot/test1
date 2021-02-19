@@ -1,359 +1,161 @@
-const express = require('express');
-const app = express();
+const { VK } = require('vk-io');
+const vk = new VK({ token: process.env.TOKEN });
+const low = require('lowdb');
+const FileSync = require('lowdb/adapters/FileSync');
+const adapter = new FileSync('db.json');
+const db = low(adapter);
 
-/* Import config */
-const config = require('./src/config');
+db.defaults({ users: [], chats: [] }).write();
 
-/* Choose a port for start a server */
-const port = process.env.PORT || 80;
+setInterval( async () => {
+    db.write();
+}, 1000);
 
-/* Import express addons */
-const bodyParser = require('body-parser');
-const cors = require('cors');
+vk.updates.on('new_message', async (context, next) => {
+    if (context.senderId < 1 || context.isOutbox) return;
+    if (!context.isChat) return context.send('Только в беседе!');
 
-/* Import crypto modules */
-const qs = require('querystring');
-const crypto = require('crypto');
+    await context.loadMessagePayload();
 
-/* Import user model */
-const { User } = require('./src/mongo');
+    let user = db.get('users').find({ id: context.senderId }).value();
 
-/* Import rewards array */
-const rewards = require('./src/rewards');
-
-/* Import VK Coin API */
-const coin = require('./src/coinApi');
-
-/* Use express addons */
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(cors());
-
-app.get('*', async (req, res) => {
-    return res.send('Oops.. You\'re busted! ^_^\nPlease, leave from this page.');
+    if (!user) {
+        db.get('users').push({
+            id: context.senderId,
+            warns: 0,
+            role: 1,
+            ban: false,
+            mute: 0
+        }).write();
+        return user;
+    } else {
+        if (user.mute > Date.now()) {
+            if (user.warns + 1 == 3) {
+                context.send('Пользователь получает третье предупреждение за нарушение мута и исключается из беседы');
+                vk.api.messages.removeChatUser({
+                    chat_id: context.chatId, user_id: user.id
+                });
+                return;
+            }
+            user.warns++;
+            context.send('Пользователь получает предупреждение за нарушение мута');
+        }
+        return next();
+    }
 });
 
-app.post('/getUserInformation', async (req, res) => {
-
-    if (!req.body.sign) {
-        return res.send('Bad request data');
-    }
-
-    const urlParams = qs.parse(req.body.sign.replace(/(?:\?)/g, ''));
-    const ordered = {};
-
-    Object.keys(urlParams).sort().forEach((key) => {
-        if (key.slice(0, 3) === 'vk_') {
-            ordered[key] = urlParams[key];
+vk.updates.on('chat_invite_user', (context, next) => {
+    let user = db.get('users').find({ id: Number(context.eventMemberId) }).value();
+    if (user) {
+        if (user.ban) {
+            context.send('В беседу был приглашен забаненый пользователь!\nОн будет исключён.');
+            return vk.api.messages.removeChatUser({ chat_id: context.chatId, user_id: user.id });
         }
-    });
-    
-    const stringParams = qs.stringify(ordered);
-    const paramsHash = crypto
-    .createHmac('sha256', config.secretKey)
-    .update(stringParams)
-    .digest()
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=$/, '');
-
-    if (paramsHash !== urlParams.sign) {
-        return res.send('Invalid request data');
+        user.warns = 0;
+        user.role = 0;
+        user.mute = 0;
+        return next();
     }
+    
+    return next()
+})
 
-    const user = Number(ordered.vk_user_id);
+vk.updates.hear(/^(?:!mute|!мут)\s([0-9]+)$/i, async (context) => {
+    let user = db.get('users').find({ id: context.senderId }).value();
 
-    const result = await User.find({ user_id: user });
-    const data = result[0];
+    if (user.role < 2) return context.send('У тебя недостаточно прав!');
+    if (!context.hasReplyMessage) return context.send('Нужно переслать сообщение!');
 
-    if (!data) {
-
-        const newUser = new User({
-            user_id: user,
-            viewed: 0,
-            next: 0,
-            refferer: null,
-            refEarned: 0
-        });
-
-        return newUser.save((error) => {
-
-            if (error) {
-                return res.statusCode(500).send('Internal Server Error');
-            }
-
-            return res.send({
-                viewed: 0,
-                left: 100,
-                earnedByRef: 0
+    const reply = db.get('users').find({ id: context.replyMessage.senderId }).value();
+    if (user.id == reply.id) return context.send('Нельзя выдать мут самому себе :(');
+    if (reply.role > user.role) {
+        user.warns++;
+        if (user.warns == 3) {
+            vk.api.messages.removeChatUser({
+                chat_id: context.chatId, user_id: user.id
             });
-
-        });
-
+            return context.send(`@id${user.id} (Пользователь) был исключен!`);
+        }
+        return context.send(`Нельзя выдать мут пользователю с высшей ролью!\n@id${user.id} (Вам) выдано предупреждение!`);
     }
 
-    const currentReward = rewards.findIndex(element => element.reward <= data.viewed) + 1;
-    const left = rewards[currentReward + 1].views - data.viewed;
-
-    return res.send({
-        viewed: data.viewed,
-        left: left,
-        earnedByRef: data.refEarned
-    });
-
+    const seconds = Number(context.$match[1]) * 1000;
+    reply.mute = Date.now() + seconds;
+    context.send(`Пользователь был заткнут на ${context.$match[1]} сек.`);
 });
 
-app.post('/viewAd', async (req, res) => {
+vk.updates.hear(/^(?:!ban|!бан)$/i, async (context) => {
+    let user = db.get('users').find({ id: context.senderId }).value();
 
-    if (!req.body.sign || !req.body.key) {
-        return res.send('Bad request data');
-    }
+    if (user.role < 3) return context.send('У тебя недостаточно прав!');
+    if (!context.hasReplyMessage) return context.send('Нужно переслать сообщение!');
 
-    req.body.key = req.body.key.split('-');
-
-    if (req.body.key[0].length < 32 || Number(req.body.key[1]) < 0 || Number(req.body.key[2]) < Date.now() - 86400000) {
-        return res.send('Bad request key');
-    }
-
-    const urlParams = qs.parse(req.body.sign.replace(/(?:\?)/g, ''));
-    const ordered = {};
-
-    Object.keys(urlParams).sort().forEach((key) => {
-        if (key.slice(0, 3) === 'vk_') {
-            ordered[key] = urlParams[key];
+    const reply = db.get('users').find({ id: context.replyMessage.senderId }).value();
+    if (user.id == reply.id) return context.send('Нельзя выдать бан самому себе :(');
+    if (reply.role > user.role) {
+        user.warns++;
+        if (user.warns == 3) {
+            vk.api.messages.removeChatUser({
+                chat_id: context.chatId, user_id: user.id
+            });
+            return context.send(`@id${user.id} (Пользователь) был исключен!`);
         }
-    });
-    
-    const stringParams = qs.stringify(ordered);
-    const paramsHash = crypto
-    .createHmac('sha256', config.secretKey)
-    .update(stringParams)
-    .digest()
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=$/, '');
-
-    if (paramsHash !== urlParams.sign) {
-        return res.send('Invalid request data');
+        return context.send(`Нельзя выдать бан пользователю с высшей ролью!\n@id${user.id} (Вам) выдано предупреждение!`);
     }
-
-    const user = Number(ordered.vk_user_id);
-
-    const result = await User.find({ user_id: user });
-    const data = result[0];
-
-    if (!data) {
-
-        const newUser = new User({
-            user_id: user,
-            viewed: 0,
-            next: 0,
-            refferer: null,
-            refEarned: 0
-        });
-
-        return newUser.save((error) => {
-            if (error) {
-                return res.statusCode(500).send('Internal Server Error');
-            }
-        });
-
-    }
-
-    if (data.next > Date.now()) {
-        return res.send('Wait 3 seconds');
-    }
-
-    const currentRewardIndex = rewards.findIndex(element => element.reward <= data.viewed) + 1;
-    const currentReward = rewards[currentRewardIndex].reward;
-
-    await coin.api.sendPayment(user, currentReward * 1000, false);
-
-    data.viewed += 1;
-    data.next = Date.now() + 3000;
-
-    const refResult = await User.find({ user_id: data.refferer });
-    const refData = refResult[0];
-
-    if (refData) {
-
-        const reffererReward = currentReward >= 1000 ? 1000 : currentReward;
-        refData.refEarned += reffererReward;
-
-        await coin.api.sendPayment(data.refferer, reffererReward * 1000, false);
-        await refData.save();
-
-    }
-
-    return data.save((error) => {
-
-        if (error) {
-            return res.statusCode(500).send('Internal Server Error');
-        }
-
-        return res.send({
-            response: true
-        });
-
-    });
-
+    reply.ban = true;
+    context.send(`@id${u.id}(Пользователь) был забанен в беседе!`);
+    vk.api.messages.removeChatUser({ chat_id: context.chatId, user_id: reply.id });
 });
 
-app.post('/badAd', async (req, res) => {
+vk.updates.hear(/^(?:!warn|!пред|!предупреждение)$/i, async (context) => {
+    let user = db.get('users').find({ id: context.senderId }).value();
 
-    if (!req.body.sign || !req.body.key) {
-        return res.send('Bad request data');
-    }
+    if (user.role < 2) return context.send('У тебя недостаточно прав!');
+    if (!context.hasReplyMessage) return context.send('Нужно переслать сообщение!');
 
-    req.body.key = req.body.key.split('-');
-
-    if (req.body.key[0].length < 32 || Number(req.body.key[1]) < 0 || Number(req.body.key[2]) < Date.now() - 86400000) {
-        return res.send('Bad request key');
-    }
-
-    const urlParams = qs.parse(req.body.sign.replace(/(?:\?)/g, ''));
-    const ordered = {};
-
-    Object.keys(urlParams).sort().forEach((key) => {
-        if (key.slice(0, 3) === 'vk_') {
-            ordered[key] = urlParams[key];
+    const reply = db.get('users').find({ id: context.replyMessage.senderId }).value();
+    if (user.id == reply.id) return context.send('Нельзя выдать предупреждение самому себе :(');
+    if (reply.role > user.role) {
+        user.warns++;
+        if (user.warns == 3) {
+            vk.api.messages.removeChatUser({
+                chat_id: context.chatId, user_id: user.id
+            });
+            return context.send(`@id${user.id} (Пользователь) был исключен!`);
         }
-    });
-    
-    const stringParams = qs.stringify(ordered);
-    const paramsHash = crypto
-    .createHmac('sha256', config.secretKey)
-    .update(stringParams)
-    .digest()
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=$/, '');
-
-    if (paramsHash !== urlParams.sign) {
-        return res.send('Invalid request data');
+        return context.send(`Нельзя выдать предупреждение пользователю с высшей ролью!\n@id${user.id} (Вам) выдано предупреждение!`);
     }
-
-    const user = Number(ordered.vk_user_id);
-
-    const result = await User.find({ user_id: user });
-    const data = result[0];
-
-    if (!data) {
-
-        const newUser = new User({
-            user_id: user,
-            viewed: 0,
-            next: 0,
-            refferer: null,
-            refEarned: 0
+    if (reply.warns + 1 == 3) {
+        context.send('Пользователь получает третье предупреждение за нарушение мута и исключается из беседы');
+        vk.api.messages.removeChatUser({
+            chat_id: context.chatId, user_id: reply.id
         });
-
-        return newUser.save((error) => {
-            if (error) {
-                return res.statusCode(500).send('Internal Server Error');
-            }
-        });
-
+        return;
     }
-
-    if (data.next > Date.now()) {
-        return res.send('Wait 3 seconds');
-    }
-
-    const currentReward = 10;
-
-    await coin.api.sendPayment(user, currentReward * 1000, false);
-
-    data.viewed += 1;
-    data.next = Date.now() + 3000;
-
-    const refResult = await User.find({ user_id: data.refferer });
-    const refData = refResult[0];
-
-    if (refData) {
-
-        const reffererReward = 10;
-        refData.refEarned += reffererReward;
-
-        await coin.api.sendPayment(data.refferer, reffererReward * 1000, false);
-        await refData.save();
-
-    }
-
-    return data.save((error) => {
-
-        if (error) {
-            return res.statusCode(500).send('Internal Server Error');
-        }
-
-        return res.send({
-            response: true
-        });
-
-    });
-
+    reply.warns++;
+    context.send(`@id${reply.id} (Пользователь) получил 1 предупреждение`);
 });
 
-app.post('/joinRefferal', async (req, res) => {
+vk.updates.hear(/^(?:!kick|!кик)$/i, async (context) => {
+    let user = db.get('users').find({ id: context.senderId }).value();
 
-    if (!req.body.sign || !req.body.user) {
-        return res.send('Bad request data');
-    }
+    if (user.role < 2) return context.send('У тебя недостаточно прав!');
+    if (!context.hasReplyMessage) return context.send('Нужно переслать сообщение!');
 
-    const urlParams = qs.parse(req.body.sign.replace(/(?:\?)/g, ''));
-    const ordered = {};
-
-    Object.keys(urlParams).sort().forEach((key) => {
-        if (key.slice(0, 3) === 'vk_') {
-            ordered[key] = urlParams[key];
+    const reply = db.get('users').find({ id: context.replyMessage.senderId }).value();
+    if (user.id == reply.id) return context.send('Нельзя кикнуть самому себе :(');
+    if (reply.role > user.role) {
+        user.warns++;
+        if (user.warns == 3) {
+            vk.api.messages.removeChatUser({
+                chat_id: context.chatId, user_id: user.id
+            });
+            return context.send(`@id${user.id} (Пользователь) был исключен!`);
         }
-    });
-    
-    const stringParams = qs.stringify(ordered);
-    const paramsHash = crypto
-    .createHmac('sha256', config.secretKey)
-    .update(stringParams)
-    .digest()
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=$/, '');
-
-    if (paramsHash !== urlParams.sign) {
-        return res.send('Invalid request data');
+        return context.send(`Нельзя кикнуть пользователю с высшей ролью!\n@id${user.id} (Вам) выдано предупреждение!`);
     }
+    vk.api.messages.removeChatUser({ chat_id: msg.chatId, user_id: reply.id })
+    context.send(`@id${reply.id}(Пользователь) был кикнут из беседы`);
+})
 
-    const user = Number(ordered.vk_user_id);
-
-    const result = await User.find({ user_id: user });
-    const data = result[0];
-
-    if (!data || data.refferer || req.body.user === user || Number(req.body.user) < 1) {
-        return res.send('Invalid request data');
-    }
-
-    data.refferer = req.body.user;
-
-    return data.save((error) => {
-
-        if (error) {
-            return res.statusCode(500).send('Internal Server Error');
-        }
-
-        return res.send({
-            response: true
-        });
-
-    });
-
-});
-
-app.post('*', async (req, res) => {
-    return res.send('Bad request route');
-});
-
-/* Start */
-app.listen(port, () => console.log(`Started at port ${port}`));
+vk.updates.start().catch(console.error);
